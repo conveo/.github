@@ -1,0 +1,74 @@
+# Conveo baseline gitleaks config.
+#
+# Used by the reusable workflow at .github/workflows/gitleaks.yml when a calling
+# repo has no .gitleaks.toml of its own. Calling repos can override by either
+# committing their own .gitleaks.toml or passing `config-path` to the workflow.
+#
+# Custom rules below target keys that the gitleaks default ruleset misses but
+# which we know are in use across GTM apps (see audit summary at
+# https://github.com/conveo/.github/blob/main/GOVERNANCE.md).
+
+[extend]
+useDefault = true
+
+# ---- Custom rules ----------------------------------------------------------
+
+[[rules]]
+id = "voyage-api-key"
+description = "Voyage AI API key"
+regex = '''pa-[A-Za-z0-9_-]{32,}'''
+keywords = ["pa-"]
+
+[[rules]]
+id = "elevenlabs-api-key"
+description = "ElevenLabs API key"
+regex = '''(?i)(elevenlabs|xi[-_]?api[-_]?key)[^\n]{0,40}sk_[A-Za-z0-9]{32,}'''
+keywords = ["elevenlabs", "xi-api-key", "sk_"]
+
+[[rules]]
+id = "firecrawl-api-key"
+description = "Firecrawl API key"
+regex = '''fc-[A-Za-z0-9]{32,}'''
+keywords = ["fc-"]
+
+[[rules]]
+id = "logodev-api-key"
+description = "logo.dev API key"
+regex = '''(?i)logo[._-]?dev[^\n]{0,40}(pk|sk)_[A-Za-z0-9]{24,}'''
+keywords = ["logo.dev", "logodev"]
+
+[[rules]]
+id = "supabase-service-role-jwt"
+description = "Supabase service_role JWT (high blast radius)"
+regex = '''eyJ[A-Za-z0-9_-]{20,}\.eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}'''
+keywords = ["service_role", "SUPABASE_SERVICE", "eyJ"]
+[rules.allowlist]
+description = "Anon-role JWTs are public by design; service_role is the dangerous one."
+regexes = ['''"role"\s*:\s*"anon"''']
+
+# ---- Global allowlist ------------------------------------------------------
+
+[allowlist]
+description = "Paths and patterns that produce only false positives."
+paths = [
+  '''(.*?)\.example($|/)''',
+  '''(.*?)\.sample($|/)''',
+  '''(^|/)\.env\.example$''',
+  '''(^|/)\.env\.sample$''',
+  '''(^|/)fixtures?/''',
+  '''(^|/)__fixtures__/''',
+  '''(^|/)__mocks__/''',
+  '''(^|/)testdata/''',
+  '''(^|/)vendor/''',
+  '''(^|/)node_modules/''',
+  '''(^|/)pnpm-lock\.yaml$''',
+  '''(^|/)package-lock\.json$''',
+  '''(^|/)yarn\.lock$''',
+  '''(^|/)go\.sum$''',
+  '''(^|/)Cargo\.lock$''',
+]
+
+# Common placeholder values that get flagged as generic high-entropy strings.
+regexes = [
+  '''(?i)(your[-_]?(api[-_]?)?key[-_]?here|REPLACE[-_]?ME|EXAMPLE[-_]?KEY|xxxxxxxx)''',
+]

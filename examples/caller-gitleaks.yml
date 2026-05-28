@@ -1,0 +1,30 @@
+# Drop this file into a calling repo at .github/workflows/gitleaks.yml.
+#
+# It runs on:
+#   - every pull request (scans diff only — fast)
+#   - every push to main (scans full history — catches force-pushes / merges)
+#   - a weekly schedule (catches keys committed against pre-existing rules)
+#
+# Pin the @ref to a tag once we cut releases. `main` is fine until then.
+
+name: gitleaks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * 1"  # Mondays 06:00 UTC
+
+jobs:
+  gitleaks:
+    uses: conveo/.github/.github/workflows/gitleaks.yml@main
+    permissions:
+      contents: read
+      security-events: write
+      pull-requests: read
+    # Optional inputs — defaults are usually fine.
+    # with:
+    #   config-path: .security/gitleaks.toml
+    #   scan-mode: auto
+    #   gitleaks-version: "8.21.2"

@@ -1,0 +1,159 @@
+name: gitleaks
+
+# Dual-purpose secret-scanning workflow:
+#   1. `workflow_call` — callers reference explicitly via
+#      `uses: conveo/.github/.github/workflows/gitleaks.yml@<ref>`.
+#   2. `pull_request` — selected by an org-level branch ruleset
+#      ("Require workflows to pass before merging") to auto-enforce on target
+#      repos with no per-repo workflow file. See GOVERNANCE.md.
+#
+# Defaults:
+#   - Hard fails on any finding. No `continue-on-error`.
+#   - PR runs scan the diff (base..head). Push/schedule runs scan full history.
+#   - Uses the conveo baseline .gitleaks.toml unless the caller provides one.
+#   - SARIF is uploaded to GitHub code scanning so findings show in the Security tab.
+
+on:
+  workflow_call:
+    inputs:
+      config-path:
+        description: "Path (in the calling repo) to a .gitleaks.toml. If empty, falls back to repo-root .gitleaks.toml, then to the conveo baseline."
+        type: string
+        required: false
+        default: ""
+      scan-mode:
+        description: "auto | diff | full. 'auto' = diff on pull_request, full otherwise."
+        type: string
+        required: false
+        default: "auto"
+      gitleaks-version:
+        description: "Pinned gitleaks CLI version. Bump in GOVERNANCE.md, not per-caller."
+        type: string
+        required: false
+        default: "8.21.2"
+      governance-ref:
+        description: "Ref of conveo/.github to pull the baseline config from."
+        type: string
+        required: false
+        default: "main"
+  # Ruleset enforcement path. Ruleset-selected workflows ignore branches/paths
+  # filters, so we keep this minimal and let the ruleset decide targeting.
+  pull_request:
+  merge_group:
+
+concurrency:
+  group: gitleaks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: read
+
+jobs:
+  scan:
+    name: Scan for secrets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout calling repo (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout governance baseline
+        uses: actions/checkout@v4
+        with:
+          repository: conveo/.github
+          ref: ${{ inputs.governance-ref || 'main' }}
+          path: .conveo-governance
+          fetch-depth: 1
+
+      - name: Install gitleaks
+        env:
+          VERSION: ${{ inputs.gitleaks-version || '8.21.2' }}
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz"
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Resolve config and scan mode
+        id: resolve
+        env:
+          REQUESTED_CONFIG: ${{ inputs.config-path }}
+          REQUESTED_MODE: ${{ inputs.scan-mode || 'auto' }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "$REQUESTED_CONFIG" && -f "$REQUESTED_CONFIG" ]]; then
+            CONFIG="$REQUESTED_CONFIG"
+            SOURCE="caller-input"
+          elif [[ -f .gitleaks.toml ]]; then
+            CONFIG=".gitleaks.toml"
+            SOURCE="caller-repo-root"
+          else
+            CONFIG=".conveo-governance/.gitleaks.toml"
+            SOURCE="conveo-baseline"
+          fi
+          echo "config=$CONFIG" >> "$GITHUB_OUTPUT"
+          echo "Using config: $CONFIG ($SOURCE)"
+
+          if [[ "$REQUESTED_MODE" == "auto" ]]; then
+            if [[ "$EVENT_NAME" == "pull_request" ]]; then
+              MODE="diff"
+            else
+              MODE="full"
+            fi
+          else
+            MODE="$REQUESTED_MODE"
+          fi
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "Scan mode: $MODE"
+
+      - name: Gitleaks scan (full history)
+        if: steps.resolve.outputs.mode == 'full'
+        run: |
+          gitleaks detect \
+            --source . \
+            --config "${{ steps.resolve.outputs.config }}" \
+            --redact \
+            --report-format sarif \
+            --report-path gitleaks.sarif \
+            --exit-code 1 \
+            --no-banner
+
+      - name: Gitleaks scan (PR diff)
+        if: steps.resolve.outputs.mode == 'diff'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "$BASE_SHA" || true
+          gitleaks detect \
+            --source . \
+            --config "${{ steps.resolve.outputs.config }}" \
+            --log-opts "${BASE_SHA}..${HEAD_SHA}" \
+            --redact \
+            --report-format sarif \
+            --report-path gitleaks.sarif \
+            --exit-code 1 \
+            --no-banner
+
+      - name: Upload SARIF to code scanning
+        if: ${{ always() && hashFiles('gitleaks.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+
+      - name: Upload SARIF artifact
+        if: ${{ always() && hashFiles('gitleaks.sarif') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-sarif
+          path: gitleaks.sarif
+          retention-days: 30
