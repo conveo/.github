@@ -47,8 +47,9 @@ concurrency:
 
 permissions:
   contents: read
-  security-events: write
+  security-events: write   # upload SARIF to code scanning
   pull-requests: read
+  actions: read            # upload-sarif looks up the workflow run
 
 jobs:
   scan:
@@ -56,12 +57,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout calling repo (full history)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Checkout governance baseline
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: conveo/.github
           ref: ${{ inputs.governance-ref || 'main' }}
@@ -144,8 +145,14 @@ jobs:
             --no-banner
 
       - name: Upload SARIF to code scanning
+        # Best-effort: code scanning needs GitHub Advanced Security, which many
+        # internal/private repos don't have. The authoritative gate signal is the
+        # gitleaks scan's exit code above — a failed/again unavailable upload must
+        # not turn this required check red when there are no secrets. The SARIF
+        # artifact below is the durable record either way.
+        continue-on-error: true
         if: ${{ always() && hashFiles('gitleaks.sarif') != '' }}
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: gitleaks.sarif
           category: gitleaks
