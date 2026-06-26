@@ -1,0 +1,100 @@
+# Org-wide security gate.
+#
+# This lives in conveo/.github and is enforced across repositories by an
+# organization ruleset ("Require workflows to pass before merging"), so it
+# runs against every PR in every targeted repo WITHOUT each repo needing to
+# check in its own copy. The target repo's code is what gets scanned.
+#
+# It runs Anthropic's official claude-code-security-review action through
+# Conveo's agentgateway (GH OIDC auth, no Anthropic key in any repo). The
+# action posts false-positive-filtered findings as inline PR comments and
+# uploads the findings JSON as an artifact. The gate step then fails the check
+# on any HIGH/CRITICAL finding — and fails CLOSED if the scan didn't produce a
+# clean, completed result (a security gate must not turn green when the scanner
+# breaks).
+#
+# NOTE: the action is referenced by its cross-repo path
+# (conveo/agentgateway/.github/actions/...@main) rather than a local ./ path,
+# because this workflow executes in the context of the target repo, which does
+# not contain that composite action.
+
+name: Security review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+permissions:
+  contents:      read
+  pull-requests: write   # post inline findings
+  id-token:      write   # OIDC mint for the gateway
+
+concurrency:
+  group: security-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  security-review:
+    if: github.event.pull_request.user.type != 'Bot'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd   # v5
+        with:
+          fetch-depth: 0   # diff-aware analysis
+
+      - name: Security review
+        id: review
+        uses: conveo/agentgateway/.github/actions/claude-security-review-via-gateway@main
+        with:
+          comment-pr: "true"
+          # Scan EVERY commit, not just the first. Upstream caches a
+          # once-per-PR marker by default and skips later pushes; for a
+          # blocking gate that would let a HIGH finding added in commit 2+
+          # sail through ungated.
+          run-every-commit: "true"
+          # Append Conveo-specific concerns (gateway CEL authz, token handling)
+          # by pointing this at a markdown file in the repo:
+          # custom-security-scan-instructions: .github/security-scan-instructions.md
+
+      - name: Gate on HIGH/CRITICAL findings (fail closed)
+        if: always()
+        env:
+          REVIEW_OUTCOME: ${{ steps.review.outcome }}
+          RESULTS:        ${{ steps.review.outputs.results-file }}
+          ERRLOG:         ${{ steps.review.outputs.error-log }}
+          COUNT:          ${{ steps.review.outputs.findings-count }}
+        run: |
+          set -uo pipefail
+          echo "## Security review" >> "$GITHUB_STEP_SUMMARY"
+
+          fail_closed() {
+            echo "::error::Security gate FAILED CLOSED — $1"
+            echo "- ❌ Gate: **failed closed** — $1" >> "$GITHUB_STEP_SUMMARY"
+            [ -n "${ERRLOG:-}" ] && [ -f "$ERRLOG" ] && { echo "--- scanner stderr ---"; cat "$ERRLOG"; }
+            exit 1
+          }
+
+          # 1. The scan step itself must have succeeded.
+          [ "$REVIEW_OUTCOME" = "success" ] || fail_closed "scan step outcome was '$REVIEW_OUTCOME'"
+
+          # 2. A results file must exist (run-every-commit guarantees a fresh one).
+          [ -n "${RESULTS:-}" ] && [ -f "$RESULTS" ] || fail_closed "no results file at '${RESULTS:-<unset>}'"
+
+          # 3. It must be a completed review, not a scanner error object.
+          if jq -e '.error' "$RESULTS" >/dev/null 2>&1; then
+            fail_closed "scanner returned an error: $(jq -r '.error' "$RESULTS")"
+          fi
+          [ "$(jq -r '.analysis_summary.review_completed // false' "$RESULTS")" = "true" ] \
+            || fail_closed "review did not complete (analysis_summary.review_completed != true)"
+
+          # 4. Gate on the severity of kept (post-filter) findings.
+          high=$(jq '[.findings[]? | select((.severity // "" | ascii_upcase) as $s | $s == "HIGH" or $s == "CRITICAL")] | length' "$RESULTS")
+          echo "- Findings (kept): **${COUNT:-?}**"  >> "$GITHUB_STEP_SUMMARY"
+          echo "- HIGH/CRITICAL: **$high**"          >> "$GITHUB_STEP_SUMMARY"
+          if [ "$high" -gt 0 ]; then
+            echo "::error::Security review found $high HIGH/CRITICAL finding(s)."
+            echo "- ❌ Gate: failed" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "- ✅ Gate: passed" >> "$GITHUB_STEP_SUMMARY"
